@@ -16,13 +16,22 @@ RUN poetry config virtualenvs.create false && \
 
 # Set a non-root user
 RUN addgroup --system app && adduser --system --group app
-USER app
 
 # Set working directory
 WORKDIR /home/app
 
-COPY ./app ./app
-COPY gunicorn_conf.py .
+COPY --chown=app:app ./app ./app
+COPY --chown=app:app gunicorn_conf.py .
+
+# Runtime-writable dirs the app creates/uses at startup (uploads, SSL cert
+# storage, benchmarks, default sqlite data dir). Must be owned by the
+# non-root `app` user before we drop root below — COPY without --chown (and
+# any mkdir() the app does at runtime) default to root ownership otherwise,
+# which crashes startup with PermissionError under this non-root USER.
+RUN mkdir -p app/static/uploads .ssl benchmarks data && \
+    chown -R app:app app/static/uploads .ssl benchmarks data
+
+USER app
 
 # Expose the port the app runs on
 EXPOSE 8080
