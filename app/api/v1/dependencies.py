@@ -4,12 +4,11 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as redis
 import time
-import secrets
 
 from app.schema.settings import AppSettingsModel # <-- NEW
 from app.database.session import get_db
 from app.crud import apikey_crud
-from app.core.security import verify_api_key
+from app.core.security import csrf_token_is_valid, get_or_create_csrf_token, verify_api_key
 from app.database.models import APIKey
 
 logger = logging.getLogger(__name__)
@@ -22,23 +21,20 @@ def get_settings(request: Request) -> AppSettingsModel:
 # --- CSRF Token Generation and Validation ---
 async def get_csrf_token(request: Request) -> str:
     """Get CSRF token from session or create a new one."""
-    if "csrf_token" not in request.session:
-        request.session["csrf_token"] = secrets.token_hex(32)
-    return request.session["csrf_token"]
+    return get_or_create_csrf_token(request.session)
+
+def _require_valid_csrf_token(request: Request, submitted_token: str) -> bool:
+    if not csrf_token_is_valid(request.session, submitted_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch")
+    return True
 
 async def validate_csrf_token(request: Request, csrf_token: str = Form(...)):
     """Dependency to validate CSRF token from a form submission."""
-    stored_token = await get_csrf_token(request)
-    if not stored_token or not secrets.compare_digest(csrf_token, stored_token):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch")
-    return True
+    return _require_valid_csrf_token(request, csrf_token)
 
 async def validate_csrf_token_header(request: Request, x_csrf_token: str = Header(..., alias="X-CSRF-Token")):
     """Dependency to validate CSRF token from an X-CSRF-Token header for AJAX/fetch requests."""
-    stored_token = await get_csrf_token(request)
-    if not stored_token or not secrets.compare_digest(x_csrf_token, stored_token):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF token mismatch")
-    return True
+    return _require_valid_csrf_token(request, x_csrf_token)
 
 # --- Login Rate Limiting Dependency ---
 async def login_rate_limiter(request: Request):

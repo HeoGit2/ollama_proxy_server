@@ -14,7 +14,7 @@ from app.database.models import APIKey, OllamaServer
 from app.crud import log_crud, server_crud, model_metadata_crud
 from app.core.retry import retry_with_backoff, RetryConfig
 from app.schema.settings import AppSettingsModel
-from app.core.encryption import decrypt_data
+from app.core.backends import auth_headers, backend_url
 from app.core.vllm_translator import (
     translate_ollama_to_vllm_chat,
     translate_ollama_to_vllm_embeddings,
@@ -27,8 +27,7 @@ router = APIRouter(dependencies=[Depends(ip_filter), Depends(rate_limiter)])
 
 # --- Dependency to get active servers ---
 async def get_active_servers(db: AsyncSession = Depends(get_db)) -> List[OllamaServer]:
-    servers = await server_crud.get_servers(db)
-    active_servers = [s for s in servers if s.is_active]
+    active_servers = await server_crud.get_active_servers(db)
     if not active_servers:
         logger.error("No active Ollama backend servers are configured in the database.")
         raise HTTPException(
@@ -77,18 +76,11 @@ async def _send_backend_request(
     Internal function to send a single request to a backend server.
     This function is wrapped by retry logic.
     """
-    normalized_url = server.url.rstrip('/')
-    backend_url = f"{normalized_url}/api/{path}"
-
-    request_headers = headers.copy()
-    if server.encrypted_api_key:
-        api_key = decrypt_data(server.encrypted_api_key)
-        if api_key:
-            request_headers["Authorization"] = f"Bearer {api_key}"
+    request_headers = {**headers, **auth_headers(server)}
 
     backend_request = http_client.build_request(
         method=method,
-        url=backend_url,
+        url=backend_url(server, f"api/{path}"),
         headers=request_headers,
         params=query_params,
         content=body_bytes
@@ -229,12 +221,8 @@ async def _proxy_to_vllm(
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     model_name = ollama_payload.get("model")
-    
-    headers = {}
-    if server.encrypted_api_key:
-        api_key = decrypt_data(server.encrypted_api_key)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+
+    headers = auth_headers(server)
 
     # Translate path and payload based on the endpoint
     if path == "chat":
@@ -246,13 +234,13 @@ async def _proxy_to_vllm(
     else:
         raise HTTPException(status_code=404, detail=f"Endpoint '/api/{path}' not supported for vLLM servers.")
         
-    backend_url = f"{server.url.rstrip('/')}/{vllm_path}"
+    vllm_url = backend_url(server, vllm_path)
     is_streaming = vllm_payload.get("stream", False)
 
     try:
         if is_streaming:
             async def stream_generator():
-                async with http_client.stream("POST", backend_url, json=vllm_payload, timeout=600.0, headers=headers) as vllm_response:
+                async with http_client.stream("POST", vllm_url, json=vllm_payload, timeout=600.0, headers=headers) as vllm_response:
                     if vllm_response.status_code != 200:
                         error_body = await vllm_response.aread()
                         logger.error(f"vLLM server error ({vllm_response.status_code}): {error_body.decode()}")
@@ -266,7 +254,7 @@ async def _proxy_to_vllm(
             
             return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
         else: # Non-streaming
-            response = await http_client.post(backend_url, json=vllm_payload, timeout=600.0, headers=headers)
+            response = await http_client.post(vllm_url, json=vllm_payload, timeout=600.0, headers=headers)
             response.raise_for_status()
             vllm_data = response.json()
             
@@ -296,8 +284,7 @@ async def federate_models(
     using the cached model data from the database for efficiency.
     """
     logger.info("--- /tags endpoint: Starting model federation ---")
-    all_servers = await server_crud.get_servers(db)
-    servers = [s for s in all_servers if s.is_active]
+    servers = await server_crud.get_active_servers(db)
     logger.info(f"/tags: Found {len(servers)} active servers.")
 
     all_models = {}
