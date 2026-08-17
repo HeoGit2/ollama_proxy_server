@@ -1,16 +1,34 @@
 # app/core/encryption.py
-from cryptography.fernet import Fernet
-from app.core.config import settings
 import base64
+import hashlib
 import logging
+
+from cryptography.fernet import Fernet, MultiFernet
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _derive_key(secret: str) -> bytes:
+    """Derives a 32-byte Fernet key from the configured secret."""
+    digest = hashlib.sha256(secret.encode()).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _legacy_key(secret: str) -> bytes:
+    """
+    Reproduces the original key derivation, which used the first 32 characters
+    of SECRET_KEY verbatim. Kept only so previously encrypted values (backend
+    API keys) can still be decrypted and transparently re-encrypted.
+    """
+    return base64.urlsafe_b64encode(secret.encode()[:32].ljust(32, b"\0"))
+
+
 try:
-    # Use a URL-safe base64 encoded key derived from the SECRET_KEY
-    # Fernet key must be 32 bytes long.
-    key = base64.urlsafe_b64encode(settings.SECRET_KEY.encode()[:32])
-    fernet = Fernet(key)
+    fernet = MultiFernet(
+        [Fernet(_derive_key(settings.SECRET_KEY)), Fernet(_legacy_key(settings.SECRET_KEY))]
+    )
 except Exception as e:
     logger.error(f"Failed to initialize Fernet for encryption: {e}")
     fernet = None

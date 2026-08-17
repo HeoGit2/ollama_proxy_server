@@ -33,7 +33,7 @@ async def admin_playground_ui(
     context["model_groups"] = await server_crud.get_all_models_grouped_by_server(db, filter_type='chat')
     context["selected_model"] = model
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/model_playground.html", context)
+    return templates.TemplateResponse(request, "admin/model_playground.html", context)
 
 
 @router.post("/playground-stream", name="admin_playground_stream", dependencies=[Depends(validate_csrf_token_header)])

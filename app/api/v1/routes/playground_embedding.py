@@ -83,7 +83,7 @@ async def admin_embedding_playground_ui(
     context = get_template_context(request)
     context["models"] = await server_crud.get_all_available_model_names(db, filter_type='embedding')
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/embedding_playground.html", context)
+    return templates.TemplateResponse(request, "admin/embedding_playground.html", context)
 
 @router.get("/embedding-playground/prebuilt", name="admin_get_prebuilt_benchmarks")
 async def admin_get_prebuilt_benchmarks(admin_user: User = Depends(require_admin_user)):

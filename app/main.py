@@ -209,7 +209,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SECRET_KEY,
+    session_cookie="session",
+    max_age=settings.SESSION_MAX_AGE_SECONDS,
+    same_site="lax",
+    https_only=settings.SESSION_COOKIE_SECURE,
+)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
