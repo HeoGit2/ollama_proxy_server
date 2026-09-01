@@ -13,7 +13,9 @@ from app.database.session import get_db
 from app.database.models import User
 from app.crud import server_crud
 from app.api.v1.dependencies import validate_csrf_token_header
-from app.api.v1.routes.admin import require_admin_user, get_template_context, templates
+from app.api.v1.routes.admin import require_admin_user
+from app.core.backends import auth_headers, backend_url
+from app.core.templating import render_template
 from app.core.test_prompts import PREBUILT_TEST_PROMPTS
 from app.api.v1.routes.proxy import _select_auto_model
 
@@ -28,12 +30,12 @@ async def admin_playground_ui(
     admin_user: User = Depends(require_admin_user),
     model: Optional[str] = Query(None)
 ):
-    from app.api.v1.dependencies import get_csrf_token
-    context = get_template_context(request)
-    context["model_groups"] = await server_crud.get_all_models_grouped_by_server(db, filter_type='chat')
-    context["selected_model"] = model
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/model_playground.html", context)
+    return render_template(
+        request,
+        "admin/model_playground.html",
+        model_groups=await server_crud.get_all_models_grouped_by_server(db, filter_type='chat'),
+        selected_model=model,
+    )
 
 
 @router.post("/playground-stream", name="admin_playground_stream", dependencies=[Depends(validate_csrf_token_header)])
@@ -82,7 +84,7 @@ async def admin_playground_stream(
         
         servers_with_model = await server_crud.get_servers_with_model(db, model_name)
         if not servers_with_model:
-            active_servers = [s for s in await server_crud.get_servers(db) if s.is_active]
+            active_servers = await server_crud.get_active_servers(db)
             if not active_servers:
                 error_payload = {"error": "No active backend servers available."}
                 return Response(json.dumps(error_payload), media_type="application/x-ndjson", status_code=503)
@@ -93,7 +95,7 @@ async def admin_playground_stream(
         if target_server.server_type == 'vllm':
             from app.core.vllm_translator import translate_ollama_to_vllm_chat, vllm_stream_to_ollama_stream
             
-            chat_url = f"{target_server.url.rstrip('/')}/v1/chat/completions"
+            chat_url = backend_url(target_server, "v1/chat/completions")
             
             ollama_payload = {
                 "model": model_name,
@@ -104,8 +106,8 @@ async def admin_playground_stream(
                 ollama_payload["think"] = True
             
             payload = translate_ollama_to_vllm_chat(ollama_payload)
-            
-            headers = server_crud.get_auth_headers(target_server)
+
+            headers = auth_headers(target_server)
 
             async def event_stream_vllm():
                 try:
@@ -128,7 +130,7 @@ async def admin_playground_stream(
             return StreamingResponse(event_stream_vllm(), media_type="application/x-ndjson")
 
         else: # Ollama server
-            chat_url = f"{target_server.url.rstrip('/')}/api/chat"
+            chat_url = backend_url(target_server, "api/chat")
             payload = {"model": model_name, "messages": messages, "stream": True}
 
             if think_option:
@@ -140,7 +142,7 @@ async def admin_playground_stream(
                 else:
                     logger.warning(f"Frontend requested thinking for '{model_name}', but it's not in the known support list. Ignoring 'think' parameter.")
 
-            headers = server_crud.get_auth_headers(target_server)
+            headers = auth_headers(target_server)
 
             async def event_stream_ollama():
                 final_chunk_from_ollama = None

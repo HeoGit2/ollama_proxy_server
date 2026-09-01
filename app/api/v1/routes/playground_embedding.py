@@ -18,8 +18,10 @@ from app.database.session import get_db
 from app.database.models import User
 from app.crud import server_crud
 from app.api.v1.dependencies import validate_csrf_token_header
-from app.api.v1.routes.admin import require_admin_user, get_template_context, templates
+from app.api.v1.routes.admin import require_admin_user
+from app.core.backends import auth_headers, backend_url
 from app.core.benchmarks import PREBUILT_BENCHMARKS
+from app.core.templating import render_template
 
 
 logger = logging.getLogger(__name__)
@@ -48,17 +50,17 @@ async def get_embedding(
     prompt: str
 ) -> List[float]:
     """Helper to get a single embedding from a server."""
-    headers = server_crud.get_auth_headers(server)
+    headers = auth_headers(server)
     try:
         if server.server_type == 'vllm':
             from app.core.vllm_translator import translate_ollama_to_vllm_embeddings, translate_vllm_to_ollama_embeddings
-            url = f"{server.url.rstrip('/')}/v1/embeddings"
+            url = backend_url(server, "v1/embeddings")
             payload = translate_ollama_to_vllm_embeddings({"model": model_name, "prompt": prompt})
             response = await http_client.post(url, json=payload, timeout=60.0, headers=headers)
             response.raise_for_status()
             return translate_vllm_to_ollama_embeddings(response.json())["embedding"]
         else: # Ollama
-            url = f"{server.url.rstrip('/')}/api/embeddings"
+            url = backend_url(server, "api/embeddings")
             payload = {"model": model_name, "prompt": prompt}
             response = await http_client.post(url, json=payload, timeout=60.0, headers=headers)
             response.raise_for_status()
@@ -78,11 +80,11 @@ async def admin_embedding_playground_ui(
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(require_admin_user)
 ):
-    from app.api.v1.dependencies import get_csrf_token
-    context = get_template_context(request)
-    context["models"] = await server_crud.get_all_available_model_names(db, filter_type='embedding')
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/embedding_playground.html", context)
+    return render_template(
+        request,
+        "admin/embedding_playground.html",
+        models=await server_crud.get_all_available_model_names(db, filter_type='embedding'),
+    )
 
 @router.get("/embedding-playground/prebuilt", name="admin_get_prebuilt_benchmarks")
 async def admin_get_prebuilt_benchmarks(admin_user: User = Depends(require_admin_user)):

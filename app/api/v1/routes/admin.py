@@ -12,26 +12,25 @@ import os
 from pydantic import AnyHttpUrl
 
 from fastapi import APIRouter, Depends, Request, Form, HTTPException, status, Query, UploadFile, File
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.security import verify_password
+from app.core.templating import flash, flash_result, redirect_to, render_template
 from app.database.session import get_db
-from app.database.models import User
+from app.database.models import OllamaServer, User
 from app.crud import user_crud, apikey_crud, log_crud, server_crud, settings_crud, model_metadata_crud
 from app.schema.user import UserCreate
 from app.schema.server import ServerCreate, ServerUpdate
 from app.schema.settings import AppSettingsModel
-from app.api.v1.dependencies import get_csrf_token, validate_csrf_token, login_rate_limiter
+from app.api.v1.dependencies import validate_csrf_token, login_rate_limiter
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
 
 # --- Constants for Logo Upload ---
 MAX_LOGO_SIZE_MB = 2
@@ -123,24 +122,32 @@ async def get_active_rate_limits(
         
     return sorted(limits, key=sort_key, reverse=True)[:10]
 
-# --- Helper to add common context to all templates ---
-def get_template_context(request: Request) -> dict:
+async def get_server_or_404(db: AsyncSession, server_id: int) -> OllamaServer:
+    server = await server_crud.get_server_by_id(db, server_id=server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return server
+
+async def get_user_or_404(db: AsyncSession, user_id: int) -> User:
+    user = await user_crud.get_user_by_id(db, user_id=user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+def build_usage_chart_context(daily_stats, hourly_stats, server_stats, model_stats) -> dict:
+    """Turns aggregated usage rows into the label/data series the chart templates expect."""
+    named_servers = [row for row in server_stats if row.server_name]
     return {
-        "request": request,
-        "is_redis_connected": request.app.state.redis is not None,
-        "bootstrap_settings": settings
+        "daily_labels": [row.date.strftime('%Y-%m-%d') for row in daily_stats],
+        "daily_data": [row.request_count for row in daily_stats],
+        "hourly_labels": [row['hour'] for row in hourly_stats],
+        "hourly_data": [row['request_count'] for row in hourly_stats],
+        "server_labels": [row.server_name for row in named_servers],
+        "server_data": [row.request_count for row in named_servers],
+        "model_labels": [row.model_name for row in model_stats],
+        "model_data": [row.request_count for row in model_stats],
     }
 
-def flash(request: Request, message: str, category: str = "info"):
-    """
-    FIX: Re-assign list to session to avoid mutation issues with modern SessionMiddleware.
-    """
-    messages = request.session.get("_messages", [])
-    messages.append({"message": message, "category": category})
-    request.session["_messages"] = messages
-
-def get_flashed_messages(request: Request): return request.session.pop("_messages", [])
-templates.env.globals["get_flashed_messages"] = get_flashed_messages
 async def get_current_user_from_cookie(request: Request, db: AsyncSession = Depends(get_db)) -> User | None:
     user_id = request.session.get("user_id")
     if user_id: 
@@ -156,9 +163,7 @@ async def require_admin_user(request: Request, current_user: Union[User, None] =
     
 @router.get("/login", response_class=HTMLResponse, name="admin_login")
 async def admin_login_form(request: Request):
-    context = get_template_context(request)
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/login.html", context)
+    return render_template(request, "admin/login.html")
 
 @router.post("/login", name="admin_login_post", dependencies=[Depends(login_rate_limiter), Depends(validate_csrf_token)])
 async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db), username: str = Form(...), password: str = Form(...)):
@@ -179,7 +184,7 @@ async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db),
 
     if not is_valid:
         flash(request, "Invalid username or password", "error")
-        return RedirectResponse(url=request.url_for("admin_login"), status_code=status.HTTP_303_SEE_OTHER)
+        return redirect_to(request, "admin_login")
 
     if redis_client:
         await redis_client.delete(f"login_fail:{client_ip}")
@@ -189,18 +194,16 @@ async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db),
     request.session.clear()
     request.session["user_id"] = user.id
     flash(request, "Successfully logged in.", "success")
-    return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_dashboard")
     
 @router.get("/logout", name="admin_logout")
 async def admin_logout(request: Request):
     request.session.clear()
-    return RedirectResponse(url=request.url_for("admin_login"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_login")
     
 @router.get("/dashboard", response_class=HTMLResponse, name="admin_dashboard")
 async def admin_dashboard(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    context = get_template_context(request)
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/dashboard.html", context)
+    return render_template(request, "admin/dashboard.html")
 
 # --- API ENDPOINT FOR DYNAMIC DASHBOARD DATA ---
 @router.get("/system-info", response_class=JSONResponse, name="admin_system_info")
@@ -259,37 +262,29 @@ async def admin_stats(
     sort_by: str = Query("request_count"),
     sort_order: str = Query("desc"),
 ):
-    context = get_template_context(request)
     key_usage_stats = await log_crud.get_usage_statistics(db, sort_by=sort_by, sort_order=sort_order)
-    daily_stats = await log_crud.get_daily_usage_stats(db, days=30)
-    hourly_stats = await log_crud.get_hourly_usage_stats(db)
-    server_stats = await log_crud.get_server_load_stats(db)
-    model_stats = await log_crud.get_model_usage_stats(db)
-    context.update({
-        "key_usage_stats": key_usage_stats,
-        "daily_labels": [row.date.strftime('%Y-%m-%d') for row in daily_stats],
-        "daily_data": [row.request_count for row in daily_stats],
-        "hourly_labels": [row['hour'] for row in hourly_stats],
-        "hourly_data": [row['request_count'] for row in hourly_stats],
-        "server_labels": [row.server_name for row in server_stats],
-        "server_data": [row.request_count for row in server_stats],
-        "model_labels": [row.model_name for row in model_stats],
-        "model_data": [row.request_count for row in model_stats],
-        "sort_by": sort_by,
-        "sort_order": sort_order,
-    })
-    return templates.TemplateResponse(request, "admin/statistics.html", context)
+    chart_context = build_usage_chart_context(
+        await log_crud.get_daily_usage_stats(db, days=30),
+        await log_crud.get_hourly_usage_stats(db),
+        await log_crud.get_server_load_stats(db),
+        await log_crud.get_model_usage_stats(db),
+    )
+    return render_template(
+        request,
+        "admin/statistics.html",
+        key_usage_stats=key_usage_stats,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        **chart_context,
+    )
 
 @router.get("/help", response_class=HTMLResponse, name="admin_help")
-async def admin_help_page(request: Request, admin_user: User = Depends(require_admin_user)): 
-    return templates.TemplateResponse(request, "admin/help.html", get_template_context(request))
+async def admin_help_page(request: Request, admin_user: User = Depends(require_admin_user)):
+    return render_template(request, "admin/help.html")
 
 @router.get("/servers", response_class=HTMLResponse, name="admin_servers")
 async def admin_server_management(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    context = get_template_context(request)
-    context["servers"] = await server_crud.get_servers(db)
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/servers.html", context)
+    return render_template(request, "admin/servers.html", servers=await server_crud.get_servers(db))
 
 @router.post("/servers/add", name="admin_add_server", dependencies=[Depends(validate_csrf_token)])
 async def admin_add_server(
@@ -312,7 +307,7 @@ async def admin_add_server(
         except Exception as e:
             logger.error(f"Error adding server '{server_name}': {e}", exc_info=True)
             flash(request, f"Could not add server '{server_name}': {e}", "error")
-    return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_servers")
 
 @router.post("/servers/{server_id}/delete", name="admin_delete_server", dependencies=[Depends(validate_csrf_token)])
 async def admin_delete_server(request: Request, server_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
@@ -322,7 +317,7 @@ async def admin_delete_server(request: Request, server_id: int, db: AsyncSession
     else:
         logger.warning(f"Attempted to delete non-existent server id {server_id}.")
         flash(request, "Server not found; nothing was deleted.", "error")
-    return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_servers")
 
 @router.post("/servers/{server_id}/refresh-models", name="admin_refresh_models", dependencies=[Depends(validate_csrf_token)])
 async def admin_refresh_models(request: Request, server_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
@@ -332,17 +327,12 @@ async def admin_refresh_models(request: Request, server_id: int, db: AsyncSessio
         flash(request, f"Successfully fetched {model_count} model(s) from server.", "success")
     else:
         flash(request, f"Failed to fetch models: {result['error']}", "error")
-    return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_servers")
 
 @router.get("/servers/{server_id}/edit", response_class=HTMLResponse, name="admin_edit_server_form")
 async def admin_edit_server_form(request: Request, server_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
-    context = get_template_context(request)
-    context["server"] = server
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/edit_server.html", context)
+    server = await get_server_or_404(db, server_id)
+    return render_template(request, "admin/edit_server.html", server=server)
 
 @router.post("/servers/{server_id}/edit", name="admin_edit_server_post", dependencies=[Depends(validate_csrf_token)])
 async def admin_edit_server_post(
@@ -370,7 +360,7 @@ async def admin_edit_server_post(
         raise HTTPException(status_code=404, detail="Server not found")
     
     flash(request, f"Server '{name}' updated successfully.", "success")
-    return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_servers")
 
 
 # --- NEW SERVER MODEL MANAGEMENT ROUTES ---
@@ -382,14 +372,8 @@ async def admin_manage_server_models(
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(require_admin_user)
 ):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
-
-    context = get_template_context(request)
-    context["server"] = server
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/manage_server.html", context)
+    server = await get_server_or_404(db, server_id)
+    return render_template(request, "admin/manage_server.html", server=server)
 
 @router.post("/servers/{server_id}/pull", name="admin_pull_model", dependencies=[Depends(validate_csrf_token)])
 async def admin_pull_model(
@@ -399,23 +383,19 @@ async def admin_pull_model(
     admin_user: User = Depends(require_admin_user),
     model_name: str = Form(...)
 ):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = await get_server_or_404(db, server_id)
 
     flash(request, f"Pull initiated for '{model_name}'. This may take several minutes...", "info")
     
     http_client: httpx.AsyncClient = request.app.state.http_client
     result = await server_crud.pull_model_on_server(http_client, server, model_name)
 
+    flash_result(request, result)
     if result["success"]:
-        flash(request, result["message"], "success")
         # Refresh the model list in the proxy's database after a successful pull
         await server_crud.fetch_and_update_models(db, server_id=server_id)
-    else:
-        flash(request, result["message"], "error")
-        
-    return RedirectResponse(url=request.url_for("admin_manage_server_models", server_id=server_id), status_code=status.HTTP_303_SEE_OTHER)
+
+    return redirect_to(request, "admin_manage_server_models", server_id=server_id)
 
 
 @router.post("/servers/{server_id}/delete-model", name="admin_delete_model", dependencies=[Depends(validate_csrf_token)])
@@ -426,21 +406,17 @@ async def admin_delete_model(
     admin_user: User = Depends(require_admin_user),
     model_name: str = Form(...)
 ):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = await get_server_or_404(db, server_id)
 
     http_client: httpx.AsyncClient = request.app.state.http_client
     result = await server_crud.delete_model_on_server(http_client, server, model_name)
 
+    flash_result(request, result)
     if result["success"]:
-        flash(request, result["message"], "success")
         # Refresh the model list in the proxy's database after a successful delete
         await server_crud.fetch_and_update_models(db, server_id=server_id)
-    else:
-        flash(request, result["message"], "error")
 
-    return RedirectResponse(url=request.url_for("admin_manage_server_models", server_id=server_id), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_manage_server_models", server_id=server_id)
 
 @router.post("/servers/{server_id}/load-model", name="admin_load_model", dependencies=[Depends(validate_csrf_token)])
 async def admin_load_model(
@@ -450,16 +426,14 @@ async def admin_load_model(
     admin_user: User = Depends(require_admin_user),
     model_name: str = Form(...)
 ):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = await get_server_or_404(db, server_id)
 
     http_client: httpx.AsyncClient = request.app.state.http_client
     result = await server_crud.load_model_on_server(http_client, server, model_name)
 
-    flash(request, result["message"], "success" if result["success"] else "error")
-    
-    return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
+    flash_result(request, result)
+
+    return redirect_to(request, "admin_dashboard")
 
 @router.post("/servers/{server_id}/unload-model", name="admin_unload_model", dependencies=[Depends(validate_csrf_token)])
 async def admin_unload_model(
@@ -469,16 +443,14 @@ async def admin_unload_model(
     admin_user: User = Depends(require_admin_user),
     model_name: str = Form(...)
 ):
-    server = await server_crud.get_server_by_id(db, server_id=server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
+    server = await get_server_or_404(db, server_id)
 
     http_client: httpx.AsyncClient = request.app.state.http_client
     result = await server_crud.unload_model_on_server(http_client, server, model_name)
 
-    flash(request, result["message"], "success" if result["success"] else "error")
-    
-    return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
+    flash_result(request, result)
+
+    return redirect_to(request, "admin_dashboard")
 
 # --- NEW: Unload model from Dashboard ---
 @router.post("/models/unload", name="admin_unload_model_dashboard", dependencies=[Depends(validate_csrf_token)])
@@ -492,16 +464,16 @@ async def admin_unload_model_dashboard(
     server = await server_crud.get_server_by_name(db, name=server_name)
     if not server:
         flash(request, f"Server '{server_name}' not found.", "error")
-        return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
+        return redirect_to(request, "admin_dashboard")
 
     http_client: httpx.AsyncClient = request.app.state.http_client
     result = await server_crud.unload_model_on_server(http_client, server, model_name)
 
-    flash(request, result["message"], "success" if result["success"] else "error")
-    
+    flash_result(request, result)
+
     await asyncio.sleep(1) # Give backend a moment to update state before reloading
-    
-    return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
+
+    return redirect_to(request, "admin_dashboard")
 
 # --- MODELS MANAGER ROUTES (NEW) ---
 @router.get("/models-manager", response_class=HTMLResponse, name="admin_models_manager")
@@ -510,16 +482,16 @@ async def admin_models_manager_page(
     db: AsyncSession = Depends(get_db), 
     admin_user: User = Depends(require_admin_user)
 ):
-    context = get_template_context(request)
-    
     # Ensure metadata exists for all discovered models
     all_model_names = await server_crud.get_all_available_model_names(db)
     for model_name in all_model_names:
         await model_metadata_crud.get_or_create_metadata(db, model_name=model_name)
-        
-    context["metadata_list"] = await model_metadata_crud.get_all_metadata(db)
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/models_manager.html", context)
+
+    return render_template(
+        request,
+        "admin/models_manager.html",
+        metadata_list=await model_metadata_crud.get_all_metadata(db),
+    )
 
 @router.post("/models-manager/update", name="admin_update_model_metadata", dependencies=[Depends(validate_csrf_token)])
 async def admin_update_model_metadata(
@@ -552,17 +524,18 @@ async def admin_update_model_metadata(
             await model_metadata_crud.update_metadata(db, model_name=metadata.model_name, **update_data)
 
     flash(request, "Model metadata updated successfully.", "success")
-    return RedirectResponse(url=request.url_for("admin_models_manager"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_models_manager")
 
 
 @router.get("/settings", response_class=HTMLResponse, name="admin_settings")
 async def admin_settings_form(request: Request, admin_user: User = Depends(require_admin_user)):
-    context = get_template_context(request)
     app_settings: AppSettingsModel = request.app.state.settings
-    context["settings"] = app_settings
-    context["themes"] = app_settings.available_themes # Pass themes to template
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/settings.html", context)
+    return render_template(
+        request,
+        "admin/settings.html",
+        settings=app_settings,
+        themes=app_settings.available_themes,  # Pass themes to template
+    )
 
 
 @router.post("/settings", name="admin_settings_post", dependencies=[Depends(validate_csrf_token)])
@@ -706,7 +679,7 @@ async def admin_settings_post(
         logger.error(f"Failed to update settings: {e}", exc_info=True)
         flash(request, "An unexpected error occurred while saving settings.", "error")
 
-    return RedirectResponse(url=request.url_for("admin_settings"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_settings")
 
 # --- USER MANAGEMENT ROUTES ---
 
@@ -718,12 +691,13 @@ async def admin_user_management(
     sort_by: str = Query("username"),
     sort_order: str = Query("asc"),
 ):
-    context = get_template_context(request)
-    context["users"] = await user_crud.get_users(db, sort_by=sort_by, sort_order=sort_order)
-    context["csrf_token"] = await get_csrf_token(request)
-    context["sort_by"] = sort_by
-    context["sort_order"] = sort_order
-    return templates.TemplateResponse(request, "admin/users.html", context)
+    return render_template(
+        request,
+        "admin/users.html",
+        users=await user_crud.get_users(db, sort_by=sort_by, sort_order=sort_order),
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
 
 @router.post("/users", name="create_new_user", dependencies=[Depends(validate_csrf_token)])
 async def create_new_user(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user), username: str = Form(...), password: str = Form(...)):
@@ -734,17 +708,12 @@ async def create_new_user(request: Request, db: AsyncSession = Depends(get_db), 
         user_in = UserCreate(username=username, password=password)
         await user_crud.create_user(db, user=user_in)
         flash(request, f"User '{username}' created successfully.", "success")
-    return RedirectResponse(url=request.url_for("admin_users"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_users")
 
 @router.get("/users/{user_id}/edit", response_class=HTMLResponse, name="admin_edit_user_form")
 async def admin_edit_user_form(request: Request, user_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    user = await user_crud.get_user_by_id(db, user_id=user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    context = get_template_context(request)
-    context["user"] = user
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/edit_user.html", context)
+    user = await get_user_or_404(db, user_id)
+    return render_template(request, "admin/edit_user.html", user=user)
 
 @router.post("/users/{user_id}/edit", name="admin_edit_user_post", dependencies=[Depends(validate_csrf_token)])
 async def admin_edit_user_post(
@@ -759,24 +728,24 @@ async def admin_edit_user_post(
     existing_user = await user_crud.get_user_by_username(db, username=username)
     if existing_user and existing_user.id != user_id:
         flash(request, f"Username '{username}' is already taken.", "error")
-        return RedirectResponse(url=request.url_for("admin_edit_user_form", user_id=user_id), status_code=status.HTTP_303_SEE_OTHER)
+        return redirect_to(request, "admin_edit_user_form", user_id=user_id)
 
     updated_user = await user_crud.update_user(db, user_id=user_id, username=username, password=password)
     if not updated_user:
         raise HTTPException(status_code=404, detail="User not found")
     
     flash(request, f"User '{username}' updated successfully.", "success")
-    return RedirectResponse(url=request.url_for("admin_users"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_users")
 
 @router.get("/users/{user_id}", response_class=HTMLResponse, name="get_user_details")
 async def get_user_details(request: Request, user_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    context = get_template_context(request)
-    user = await user_crud.get_user_by_id(db, user_id=user_id)
-    if not user: raise HTTPException(status_code=404, detail="User not found")
-    context["user"] = user
-    context["api_keys"] = await apikey_crud.get_api_keys_for_user(db, user_id=user_id)
-    context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse(request, "admin/user_details.html", context)
+    user = await get_user_or_404(db, user_id)
+    return render_template(
+        request,
+        "admin/user_details.html",
+        user=user,
+        api_keys=await apikey_crud.get_api_keys_for_user(db, user_id=user_id),
+    )
 
 @router.get("/users/{user_id}/stats", response_class=HTMLResponse, name="admin_user_stats")
 async def admin_user_stats(
@@ -785,31 +754,16 @@ async def admin_user_stats(
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(require_admin_user),
 ):
-    user = await user_crud.get_user_by_id(db, user_id=user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    context = get_template_context(request)
-    
-    daily_stats = await log_crud.get_daily_usage_stats_for_user(db, user_id=user_id, days=30)
-    hourly_stats = await log_crud.get_hourly_usage_stats_for_user(db, user_id=user_id)
-    server_stats = await log_crud.get_server_load_stats_for_user(db, user_id=user_id)
-    model_stats = await log_crud.get_model_usage_stats_for_user(db, user_id=user_id)
+    user = await get_user_or_404(db, user_id)
 
-    context.update({
-        "user": user,
-        "daily_labels": [row.date.strftime('%Y-%m-%d') for row in daily_stats],
-        "daily_data": [row.request_count for row in daily_stats],
-        "hourly_labels": [row['hour'] for row in hourly_stats],
-        "hourly_data": [row['request_count'] for row in hourly_stats],
-        "server_labels": [row.server_name for row in server_stats if row.server_name],
-        "server_data": [row.request_count for row in server_stats if row.server_name],
-        "model_labels": [row.model_name for row in model_stats],
-        "model_data": [row.request_count for row in model_stats],
-    })
-    
-    # Create a new template for this
-    return templates.TemplateResponse(request, "admin/user_statistics.html", context)
+    chart_context = build_usage_chart_context(
+        await log_crud.get_daily_usage_stats_for_user(db, user_id=user_id, days=30),
+        await log_crud.get_hourly_usage_stats_for_user(db, user_id=user_id),
+        await log_crud.get_server_load_stats_for_user(db, user_id=user_id),
+        await log_crud.get_model_usage_stats_for_user(db, user_id=user_id),
+    )
+
+    return render_template(request, "admin/user_statistics.html", user=user, **chart_context)
 
 @router.post("/users/{user_id}/keys/create", name="admin_create_key", dependencies=[Depends(validate_csrf_token)])
 async def create_user_api_key(
@@ -825,7 +779,7 @@ async def create_user_api_key(
     existing_key = await apikey_crud.get_api_key_by_name_and_user_id(db, key_name=key_name, user_id=user_id)
     if existing_key:
         flash(request, f"An API key with the name '{key_name}' already exists for this user.", "error")
-        return RedirectResponse(url=request.url_for("get_user_details", user_id=user_id), status_code=status.HTTP_303_SEE_OTHER)
+        return redirect_to(request, "get_user_details", user_id=user_id)
     # --- END FIX ---
 
     current_admin_id = admin_user.id
@@ -838,11 +792,8 @@ async def create_user_api_key(
         rate_limit_window_minutes=rate_limit_window_minutes
     )
     
-    context = get_template_context(request)
-    context["plain_key"] = plain_key
-    context["user_id"] = user_id
     request.state.user = await db.get(User, current_admin_id) # For base template
-    return templates.TemplateResponse(request, "admin/key_created.html", context)
+    return render_template(request, "admin/key_created.html", plain_key=plain_key, user_id=user_id)
 
 @router.post("/keys/{key_id}/toggle-active", name="admin_toggle_key_active", dependencies=[Depends(validate_csrf_token)])
 async def toggle_key_active_status(
@@ -857,7 +808,7 @@ async def toggle_key_active_status(
     
     new_status = "enabled" if key.is_active else "disabled"
     flash(request, f"API Key '{key.key_name}' has been {new_status}.", "success")
-    return RedirectResponse(url=request.url_for("get_user_details", user_id=key.user_id), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "get_user_details", user_id=key.user_id)
 
 @router.post("/keys/{key_id}/revoke", name="admin_revoke_key", dependencies=[Depends(validate_csrf_token)])
 async def revoke_user_api_key(
@@ -872,16 +823,15 @@ async def revoke_user_api_key(
     
     await apikey_crud.revoke_api_key(db, key_id=key_id)
     flash(request, f"API Key '{key.key_name}' has been revoked.", "success")
-    return RedirectResponse(url=request.url_for("get_user_details", user_id=key.user_id), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "get_user_details", user_id=key.user_id)
 
 @router.post("/users/{user_id}/delete", name="delete_user_account", dependencies=[Depends(validate_csrf_token)])
 async def delete_user_account(request: Request, user_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    user = await user_crud.get_user_by_id(db, user_id=user_id)
-    if not user: raise HTTPException(status_code=404, detail="User not found")
+    user = await get_user_or_404(db, user_id)
     if user.is_admin:
         flash(request, "Cannot delete an admin account.", "error")
-        return RedirectResponse(url=request.url_for("admin_users"), status_code=status.HTTP_303_SEE_OTHER)
+        return redirect_to(request, "admin_users")
     
     await user_crud.delete_user(db, user_id=user_id)
     flash(request, f"User '{user.username}' has been deleted.", "success")
-    return RedirectResponse(url=request.url_for("admin_users"), status_code=status.HTTP_303_SEE_OTHER)
+    return redirect_to(request, "admin_users")

@@ -1,5 +1,9 @@
 import secrets
+from typing import MutableMapping
+
 from passlib.context import CryptContext
+
+CSRF_SESSION_KEY = "csrf_token"
 
 # Hashing context for user passwords
 # --- FIX: Add "sha256_crypt" as a legacy scheme.
@@ -39,3 +43,16 @@ def generate_secure_api_key() -> (str, str, str):
     prefix = f"op_{secrets.token_urlsafe(8)}"
     secret = secrets.token_urlsafe(32)
     return f"{prefix}_{secret}", prefix, secret
+
+
+def get_or_create_csrf_token(session: MutableMapping) -> str:
+    """Returns the session's CSRF token, creating one if it does not exist yet."""
+    if CSRF_SESSION_KEY not in session:
+        session[CSRF_SESSION_KEY] = secrets.token_hex(32)
+    return session[CSRF_SESSION_KEY]
+
+
+def csrf_token_is_valid(session: MutableMapping, submitted_token: str) -> bool:
+    """Constant-time comparison of a submitted CSRF token with the session token."""
+    stored_token = get_or_create_csrf_token(session)
+    return bool(stored_token) and secrets.compare_digest(submitted_token, stored_token)
