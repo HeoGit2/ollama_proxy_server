@@ -128,8 +128,13 @@ async def _reverse_proxy(request: Request, path: str, servers: List[OllamaServer
     if not hasattr(request.app.state, 'backend_server_index'):
         request.app.state.backend_server_index = 0
 
-    # Prepare request headers (exclude 'host' header)
-    headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
+    # Prepare request headers. Client credentials for *this* proxy (API key,
+    # session cookie, CSRF token) must never be forwarded to a backend; each
+    # backend gets its own key injected in _send_backend_request().
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ('host', 'authorization', 'cookie', 'x-csrf-token')
+    }
 
     # Try each server in round-robin fashion
     num_servers = len(servers)

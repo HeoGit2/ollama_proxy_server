@@ -36,7 +36,10 @@ templates = Jinja2Templates(directory="app/templates")
 # --- Constants for Logo Upload ---
 MAX_LOGO_SIZE_MB = 2
 MAX_LOGO_SIZE_BYTES = MAX_LOGO_SIZE_MB * 1024 * 1024
-ALLOWED_LOGO_TYPES = ["image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp"]
+# SVG is intentionally excluded: it is an active content format and would be
+# served from the app's own origin, allowing script execution in admin sessions.
+ALLOWED_LOGO_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+ALLOWED_LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 UPLOADS_DIR = Path("app/static/uploads")
 SSL_DIR = Path(".ssl")
 
@@ -155,7 +158,7 @@ async def require_admin_user(request: Request, current_user: Union[User, None] =
 async def admin_login_form(request: Request):
     context = get_template_context(request)
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/login.html", context)
+    return templates.TemplateResponse(request, "admin/login.html", context)
 
 @router.post("/login", name="admin_login_post", dependencies=[Depends(login_rate_limiter), Depends(validate_csrf_token)])
 async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db), username: str = Form(...), password: str = Form(...)):
@@ -181,6 +184,9 @@ async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db),
     if redis_client:
         await redis_client.delete(f"login_fail:{client_ip}")
 
+    # Drop any pre-authentication session state (including the CSRF token an
+    # attacker could have planted) before the session becomes privileged.
+    request.session.clear()
     request.session["user_id"] = user.id
     flash(request, "Successfully logged in.", "success")
     return RedirectResponse(url=request.url_for("admin_dashboard"), status_code=status.HTTP_303_SEE_OTHER)
@@ -194,7 +200,7 @@ async def admin_logout(request: Request):
 async def admin_dashboard(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
     context = get_template_context(request)
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/dashboard.html", context)
+    return templates.TemplateResponse(request, "admin/dashboard.html", context)
 
 # --- API ENDPOINT FOR DYNAMIC DASHBOARD DATA ---
 @router.get("/system-info", response_class=JSONResponse, name="admin_system_info")
@@ -272,18 +278,18 @@ async def admin_stats(
         "sort_by": sort_by,
         "sort_order": sort_order,
     })
-    return templates.TemplateResponse("admin/statistics.html", context)
+    return templates.TemplateResponse(request, "admin/statistics.html", context)
 
 @router.get("/help", response_class=HTMLResponse, name="admin_help")
 async def admin_help_page(request: Request, admin_user: User = Depends(require_admin_user)): 
-    return templates.TemplateResponse("admin/help.html", get_template_context(request))
+    return templates.TemplateResponse(request, "admin/help.html", get_template_context(request))
 
 @router.get("/servers", response_class=HTMLResponse, name="admin_servers")
 async def admin_server_management(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
     context = get_template_context(request)
     context["servers"] = await server_crud.get_servers(db)
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/servers.html", context)
+    return templates.TemplateResponse(request, "admin/servers.html", context)
 
 @router.post("/servers/add", name="admin_add_server", dependencies=[Depends(validate_csrf_token)])
 async def admin_add_server(
@@ -336,7 +342,7 @@ async def admin_edit_server_form(request: Request, server_id: int, db: AsyncSess
     context = get_template_context(request)
     context["server"] = server
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/edit_server.html", context)
+    return templates.TemplateResponse(request, "admin/edit_server.html", context)
 
 @router.post("/servers/{server_id}/edit", name="admin_edit_server_post", dependencies=[Depends(validate_csrf_token)])
 async def admin_edit_server_post(
@@ -383,7 +389,7 @@ async def admin_manage_server_models(
     context = get_template_context(request)
     context["server"] = server
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/manage_server.html", context)
+    return templates.TemplateResponse(request, "admin/manage_server.html", context)
 
 @router.post("/servers/{server_id}/pull", name="admin_pull_model", dependencies=[Depends(validate_csrf_token)])
 async def admin_pull_model(
@@ -513,7 +519,7 @@ async def admin_models_manager_page(
         
     context["metadata_list"] = await model_metadata_crud.get_all_metadata(db)
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/models_manager.html", context)
+    return templates.TemplateResponse(request, "admin/models_manager.html", context)
 
 @router.post("/models-manager/update", name="admin_update_model_metadata", dependencies=[Depends(validate_csrf_token)])
 async def admin_update_model_metadata(
@@ -556,7 +562,7 @@ async def admin_settings_form(request: Request, admin_user: User = Depends(requi
     context["settings"] = app_settings
     context["themes"] = app_settings.available_themes # Pass themes to template
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/settings.html", context)
+    return templates.TemplateResponse(request, "admin/settings.html", context)
 
 
 @router.post("/settings", name="admin_settings_post", dependencies=[Depends(validate_csrf_token)])
@@ -585,20 +591,30 @@ async def admin_settings_post(
         final_logo_url = None
         flash(request, "Logo removed successfully.", "success")
     elif logo_file and logo_file.filename:
-        # (Validation logic for logo file remains the same)
-        file_ext = Path(logo_file.filename).suffix
-        secure_filename = f"{secrets.token_hex(16)}{file_ext}"
-        save_path = UPLOADS_DIR / secure_filename
-        try:
-            with open(save_path, "wb") as buffer: shutil.copyfileobj(logo_file.file, buffer)
-            if is_uploaded_logo:
-                old_logo_path = Path("app" + current_settings.branding_logo_url)
-                if old_logo_path.exists(): os.remove(old_logo_path)
-            final_logo_url = f"/static/uploads/{secure_filename}"
-            flash(request, "New logo uploaded successfully.", "success")
-        except Exception as e:
-            logger.error(f"Failed to save uploaded logo: {e}")
-            flash(request, f"Error saving logo: {e}", "error")
+        file_ext = Path(logo_file.filename).suffix.lower()
+        content = await logo_file.read()
+        if logo_file.content_type not in ALLOWED_LOGO_TYPES or file_ext not in ALLOWED_LOGO_EXTENSIONS:
+            flash(
+                request,
+                "Unsupported logo file type. Allowed types: "
+                f"{', '.join(sorted(ALLOWED_LOGO_EXTENSIONS))}.",
+                "error",
+            )
+        elif len(content) > MAX_LOGO_SIZE_BYTES:
+            flash(request, f"Logo file is too large (max {MAX_LOGO_SIZE_MB} MB).", "error")
+        else:
+            secure_filename = f"{secrets.token_hex(16)}{file_ext}"
+            save_path = UPLOADS_DIR / secure_filename
+            try:
+                with open(save_path, "wb") as buffer: buffer.write(content)
+                if is_uploaded_logo:
+                    old_logo_path = Path("app" + current_settings.branding_logo_url)
+                    if old_logo_path.exists(): os.remove(old_logo_path)
+                final_logo_url = f"/static/uploads/{secure_filename}"
+                flash(request, "New logo uploaded successfully.", "success")
+            except Exception as e:
+                logger.error(f"Failed to save uploaded logo: {e}")
+                flash(request, f"Error saving logo: {e}", "error")
     else:
         final_logo_url = form_data.get("branding_logo_url")
     update_data["branding_logo_url"] = final_logo_url
@@ -707,7 +723,7 @@ async def admin_user_management(
     context["csrf_token"] = await get_csrf_token(request)
     context["sort_by"] = sort_by
     context["sort_order"] = sort_order
-    return templates.TemplateResponse("admin/users.html", context)
+    return templates.TemplateResponse(request, "admin/users.html", context)
 
 @router.post("/users", name="create_new_user", dependencies=[Depends(validate_csrf_token)])
 async def create_new_user(request: Request, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user), username: str = Form(...), password: str = Form(...)):
@@ -728,7 +744,7 @@ async def admin_edit_user_form(request: Request, user_id: int, db: AsyncSession 
     context = get_template_context(request)
     context["user"] = user
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/edit_user.html", context)
+    return templates.TemplateResponse(request, "admin/edit_user.html", context)
 
 @router.post("/users/{user_id}/edit", name="admin_edit_user_post", dependencies=[Depends(validate_csrf_token)])
 async def admin_edit_user_post(
@@ -760,7 +776,7 @@ async def get_user_details(request: Request, user_id: int, db: AsyncSession = De
     context["user"] = user
     context["api_keys"] = await apikey_crud.get_api_keys_for_user(db, user_id=user_id)
     context["csrf_token"] = await get_csrf_token(request)
-    return templates.TemplateResponse("admin/user_details.html", context)
+    return templates.TemplateResponse(request, "admin/user_details.html", context)
 
 @router.get("/users/{user_id}/stats", response_class=HTMLResponse, name="admin_user_stats")
 async def admin_user_stats(
@@ -793,7 +809,7 @@ async def admin_user_stats(
     })
     
     # Create a new template for this
-    return templates.TemplateResponse("admin/user_statistics.html", context)
+    return templates.TemplateResponse(request, "admin/user_statistics.html", context)
 
 @router.post("/users/{user_id}/keys/create", name="admin_create_key", dependencies=[Depends(validate_csrf_token)])
 async def create_user_api_key(
@@ -826,7 +842,7 @@ async def create_user_api_key(
     context["plain_key"] = plain_key
     context["user_id"] = user_id
     request.state.user = await db.get(User, current_admin_id) # For base template
-    return templates.TemplateResponse("admin/key_created.html", context)
+    return templates.TemplateResponse(request, "admin/key_created.html", context)
 
 @router.post("/keys/{key_id}/toggle-active", name="admin_toggle_key_active", dependencies=[Depends(validate_csrf_token)])
 async def toggle_key_active_status(
