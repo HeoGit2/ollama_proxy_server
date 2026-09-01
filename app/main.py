@@ -119,6 +119,8 @@ async def periodic_model_refresh(app: FastAPI) -> None:
             break
         except Exception as e:
             logger.error(f"Error in periodic model refresh: {e}", exc_info=True)
+            # Back off so a failure before the interval sleep cannot spin the loop.
+            await asyncio.sleep(60)
 
 
 @asynccontextmanager
@@ -209,7 +211,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SECRET_KEY,
+    session_cookie="session",
+    max_age=settings.SESSION_MAX_AGE_SECONDS,
+    same_site="lax",
+    https_only=settings.SESSION_COOKIE_SECURE,
+)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -277,7 +286,10 @@ if __name__ == "__main__":
                             if not cert_path.is_file():
                                 logger.warning(f"SSL cert file not found at '{cert_path}'. Starting without HTTPS.")
         except Exception as e:
-                logger.info(f"Could not load SSL settings from DB (this is normal on first run). Reason: {e}")
+            logger.warning(
+                f"Could not load SSL settings from the database; starting without HTTPS. Reason: {e}",
+                exc_info=True,
+            )
 
         # --- User-friendly startup banner ---
         protocol = "https" if ssl_keyfile and ssl_certfile else "http"

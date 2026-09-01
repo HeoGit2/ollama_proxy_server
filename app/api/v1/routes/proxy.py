@@ -5,6 +5,7 @@ import datetime
 from typing import List, Tuple, Optional, Dict, Any
 from fastapi import APIRouter, Depends, Request, Response, HTTPException, status
 from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,7 +58,7 @@ async def extract_model_from_request(request: Request) -> Optional[str]:
         if isinstance(body, dict) and "model" in body:
             return body["model"]
 
-    except (json.JSONDecodeError, UnicodeDecodeError, Exception) as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         logger.debug(f"Could not extract model from request body: {e}")
 
     return None
@@ -123,12 +124,18 @@ async def _reverse_proxy(request: Request, path: str, servers: List[OllamaServer
     if not hasattr(request.app.state, 'backend_server_index'):
         request.app.state.backend_server_index = 0
 
-    # Prepare request headers (exclude 'host' header)
-    headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
+    # Prepare request headers. Client credentials for *this* proxy (API key,
+    # session cookie, CSRF token) must never be forwarded to a backend; each
+    # backend gets its own key injected in _send_backend_request().
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ('host', 'authorization', 'cookie', 'x-csrf-token')
+    }
 
     # Try each server in round-robin fashion
     num_servers = len(servers)
     servers_tried = []
+    failures: List[str] = []
 
     for server_attempt in range(num_servers):
         # Select next server using round-robin
@@ -153,6 +160,7 @@ async def _reverse_proxy(request: Request, path: str, servers: List[OllamaServer
                 raise # Re-raise HTTP exceptions from the vLLM proxy
             except Exception as e:
                 logger.warning(f"vLLM server '{chosen_server.name}' failed: {e}. Trying next server.")
+                failures.append(f"{chosen_server.name}: {type(e).__name__}: {e}")
                 continue # Try next server
 
         # --- Ollama server logic (with retries) ---
@@ -188,15 +196,18 @@ async def _reverse_proxy(request: Request, path: str, servers: List[OllamaServer
             return response, chosen_server
         else:
             # This server failed after all retries, try next server
+            last_error = retry_result.errors[-1] if retry_result.errors else "unknown error"
+            failures.append(f"{chosen_server.name}: {last_error}")
             logger.warning(
                 f"Server '{chosen_server.name}' failed after {retry_result.attempts} "
-                f"attempts. Trying next server if available."
+                f"attempts ({last_error}). Trying next server if available."
             )
 
     # All servers exhausted
     logger.error(
         f"All {num_servers} backend server(s) failed after retries. "
-        f"Servers tried: {', '.join(servers_tried)}"
+        f"Servers tried: {', '.join(servers_tried)}. "
+        f"Failures: {'; '.join(failures) if failures else 'none recorded'}"
     )
     raise HTTPException(
         status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -450,8 +461,9 @@ async def proxy_ollama(
             body = json.loads(body_bytes)
             if isinstance(body, dict) and "model" in body:
                 model_name = body["model"]
-        except (json.JSONDecodeError, Exception):
-            pass
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning(f"Could not parse request body for '/api/{path}' as JSON: {e}")
+            body = {}
 
     # Handle 'think' parameter based on model support
     if model_name and isinstance(body, dict) and "think" in body:

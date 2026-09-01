@@ -26,7 +26,7 @@ def render_template(request: Request, template_name: str, **extra_context: Any) 
     context = get_template_context(request)
     context["csrf_token"] = get_or_create_csrf_token(request.session)
     context.update(extra_context)
-    return templates.TemplateResponse(template_name, context)
+    return templates.TemplateResponse(request, template_name, context)
 
 
 def redirect_to(request: Request, route_name: str, **path_params: Any) -> RedirectResponse:

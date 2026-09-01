@@ -47,14 +47,17 @@ async def login_rate_limiter(request: Request):
     
     try:
         current_fails = await redis_client.get(key)
-        if current_fails and int(current_fails) >= 5:
-            ttl = await redis_client.ttl(key)
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Too many failed login attempts. Try again in {ttl} seconds."
-            )
+        ttl = await redis_client.ttl(key) if current_fails else None
     except Exception as e:
-        logger.error(f"Could not connect to Redis for login rate limiting: {e}")
+        # Fail open: an unreachable Redis must not lock admins out of the login page.
+        logger.error(f"Could not connect to Redis for login rate limiting: {e}", exc_info=True)
+        return True
+
+    if current_fails and int(current_fails) >= 5:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed login attempts. Try again in {ttl} seconds."
+        )
     return True
 
 # --- IP Filtering Dependency ---
@@ -152,15 +155,17 @@ async def rate_limiter(
         current_requests = await redis_client.incr(key)
         if current_requests == 1:
             await redis_client.expire(key, window)
-
-        if current_requests > limit:
-            logger.warning(f"Rate limit exceeded for API key prefix: {api_key.key_prefix}")
-            ttl = await redis_client.ttl(key)
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Rate limit exceeded. Try again in {ttl} seconds.",
-                headers={"Retry-After": str(ttl)}
-            )
+        ttl = await redis_client.ttl(key) if current_requests > limit else None
     except Exception as e:
-        logger.error(f"Could not connect to Redis for rate limiting: {e}")
+        # Fail open: rate limiting is best-effort and must not take the proxy down with Redis.
+        logger.error(f"Could not connect to Redis for rate limiting: {e}", exc_info=True)
+        return True
+
+    if current_requests > limit:
+        logger.warning(f"Rate limit exceeded for API key prefix: {api_key.key_prefix}")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Try again in {ttl} seconds.",
+            headers={"Retry-After": str(ttl)}
+        )
     return True

@@ -127,8 +127,29 @@ async def admin_run_embedding_benchmark(
         
         tasks = {text: get_embedding(http_client, server, model_name, text) for text in all_texts}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        
-        embeddings_map = {text: result for text, result in zip(tasks.keys(), results)}
+
+        embeddings_map = {}
+        failures = []
+        for text, result in zip(tasks.keys(), results):
+            if isinstance(result, BaseException):
+                detail = result.detail if isinstance(result, HTTPException) else str(result)
+                logger.error(
+                    f"Embedding failed for model '{model_name}' on server '{server.name}': {detail}"
+                )
+                failures.append(detail)
+            else:
+                embeddings_map[text] = result
+
+        if not embeddings_map:
+            model_embeddings[model_name] = {
+                "error": f"All embedding requests failed: {failures[0] if failures else 'unknown error'}"
+            }
+            continue
+
+        if failures:
+            logger.warning(
+                f"{len(failures)}/{len(tasks)} embedding requests failed for model '{model_name}'."
+            )
         model_embeddings[model_name] = embeddings_map
 
     response_data = {"models": {}, "groups": request_data.benchmark.model_dump()["groups"]}

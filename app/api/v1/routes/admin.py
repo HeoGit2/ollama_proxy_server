@@ -35,7 +35,10 @@ router = APIRouter()
 # --- Constants for Logo Upload ---
 MAX_LOGO_SIZE_MB = 2
 MAX_LOGO_SIZE_BYTES = MAX_LOGO_SIZE_MB * 1024 * 1024
-ALLOWED_LOGO_TYPES = ["image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp"]
+# SVG is intentionally excluded: it is an active content format and would be
+# served from the app's own origin, allowing script execution in admin sessions.
+ALLOWED_LOGO_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+ALLOWED_LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 UPLOADS_DIR = Path("app/static/uploads")
 SSL_DIR = Path(".ssl")
 
@@ -186,6 +189,9 @@ async def admin_login_post(request: Request, db: AsyncSession = Depends(get_db),
     if redis_client:
         await redis_client.delete(f"login_fail:{client_ip}")
 
+    # Drop any pre-authentication session state (including the CSRF token an
+    # attacker could have planted) before the session becomes privileged.
+    request.session.clear()
     request.session["user_id"] = user.id
     flash(request, "Successfully logged in.", "success")
     return redirect_to(request, "admin_dashboard")
@@ -273,7 +279,7 @@ async def admin_stats(
     )
 
 @router.get("/help", response_class=HTMLResponse, name="admin_help")
-async def admin_help_page(request: Request, admin_user: User = Depends(require_admin_user)): 
+async def admin_help_page(request: Request, admin_user: User = Depends(require_admin_user)):
     return render_template(request, "admin/help.html")
 
 @router.get("/servers", response_class=HTMLResponse, name="admin_servers")
@@ -299,14 +305,18 @@ async def admin_add_server(
             await server_crud.create_server(db, server=server_in)
             flash(request, f"Server '{server_name}' ({server_type}) added successfully.", "success")
         except Exception as e:
-            logger.error(f"Error adding server: {e}")
-            flash(request, "Invalid URL format or server type.", "error")
+            logger.error(f"Error adding server '{server_name}': {e}", exc_info=True)
+            flash(request, f"Could not add server '{server_name}': {e}", "error")
     return redirect_to(request, "admin_servers")
 
 @router.post("/servers/{server_id}/delete", name="admin_delete_server", dependencies=[Depends(validate_csrf_token)])
 async def admin_delete_server(request: Request, server_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    await server_crud.delete_server(db, server_id=server_id)
-    flash(request, "Server deleted successfully.", "success")
+    deleted_server = await server_crud.delete_server(db, server_id=server_id)
+    if deleted_server:
+        flash(request, "Server deleted successfully.", "success")
+    else:
+        logger.warning(f"Attempted to delete non-existent server id {server_id}.")
+        flash(request, "Server not found; nothing was deleted.", "error")
     return redirect_to(request, "admin_servers")
 
 @router.post("/servers/{server_id}/refresh-models", name="admin_refresh_models", dependencies=[Depends(validate_csrf_token)])
@@ -554,20 +564,30 @@ async def admin_settings_post(
         final_logo_url = None
         flash(request, "Logo removed successfully.", "success")
     elif logo_file and logo_file.filename:
-        # (Validation logic for logo file remains the same)
-        file_ext = Path(logo_file.filename).suffix
-        secure_filename = f"{secrets.token_hex(16)}{file_ext}"
-        save_path = UPLOADS_DIR / secure_filename
-        try:
-            with open(save_path, "wb") as buffer: shutil.copyfileobj(logo_file.file, buffer)
-            if is_uploaded_logo:
-                old_logo_path = Path("app" + current_settings.branding_logo_url)
-                if old_logo_path.exists(): os.remove(old_logo_path)
-            final_logo_url = f"/static/uploads/{secure_filename}"
-            flash(request, "New logo uploaded successfully.", "success")
-        except Exception as e:
-            logger.error(f"Failed to save uploaded logo: {e}")
-            flash(request, f"Error saving logo: {e}", "error")
+        file_ext = Path(logo_file.filename).suffix.lower()
+        content = await logo_file.read()
+        if logo_file.content_type not in ALLOWED_LOGO_TYPES or file_ext not in ALLOWED_LOGO_EXTENSIONS:
+            flash(
+                request,
+                "Unsupported logo file type. Allowed types: "
+                f"{', '.join(sorted(ALLOWED_LOGO_EXTENSIONS))}.",
+                "error",
+            )
+        elif len(content) > MAX_LOGO_SIZE_BYTES:
+            flash(request, f"Logo file is too large (max {MAX_LOGO_SIZE_MB} MB).", "error")
+        else:
+            secure_filename = f"{secrets.token_hex(16)}{file_ext}"
+            save_path = UPLOADS_DIR / secure_filename
+            try:
+                with open(save_path, "wb") as buffer: buffer.write(content)
+                if is_uploaded_logo:
+                    old_logo_path = Path("app" + current_settings.branding_logo_url)
+                    if old_logo_path.exists(): os.remove(old_logo_path)
+                final_logo_url = f"/static/uploads/{secure_filename}"
+                flash(request, "New logo uploaded successfully.", "success")
+            except Exception as e:
+                logger.error(f"Failed to save uploaded logo: {e}")
+                flash(request, f"Error saving logo: {e}", "error")
     else:
         final_logo_url = form_data.get("branding_logo_url")
     update_data["branding_logo_url"] = final_logo_url
@@ -632,22 +652,22 @@ async def admin_settings_post(
     ui_style = form_data.get("ui_style", current_settings.ui_style)
     new_redis_password = form_data.get("redis_password")
     
-    update_data.update({
-        "branding_title": form_data.get("branding_title"),
-        "ui_style": ui_style,
-        "selected_theme": selected_theme,
-        "redis_host": form_data.get("redis_host"),
-        "redis_port": int(form_data.get("redis_port", 6379)),
-        "redis_username": form_data.get("redis_username") or None,
-        "model_update_interval_minutes": int(form_data.get("model_update_interval_minutes", 10)),
-        "allowed_ips": form_data.get("allowed_ips", ""),
-        "denied_ips": form_data.get("denied_ips", ""),
-        "blocked_ollama_endpoints": form_data.get("blocked_ollama_endpoints", ""),
-    })
-    if new_redis_password:
-        update_data["redis_password"] = new_redis_password
-        
     try:
+        update_data.update({
+            "branding_title": form_data.get("branding_title"),
+            "ui_style": ui_style,
+            "selected_theme": selected_theme,
+            "redis_host": form_data.get("redis_host"),
+            "redis_port": int(form_data.get("redis_port", 6379)),
+            "redis_username": form_data.get("redis_username") or None,
+            "model_update_interval_minutes": int(form_data.get("model_update_interval_minutes", 10)),
+            "allowed_ips": form_data.get("allowed_ips", ""),
+            "denied_ips": form_data.get("denied_ips", ""),
+            "blocked_ollama_endpoints": form_data.get("blocked_ollama_endpoints", ""),
+        })
+        if new_redis_password:
+            update_data["redis_password"] = new_redis_password
+
         updated_settings_data = current_settings.model_copy(update=update_data)
         await settings_crud.update_app_settings(db, settings_data=updated_settings_data)
         request.app.state.settings = updated_settings_data

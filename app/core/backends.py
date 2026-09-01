@@ -1,12 +1,15 @@
 # app/core/backends.py
 """Shared helpers for talking to Ollama/vLLM backend servers."""
 import json
+import logging
 from typing import Dict
 
 import httpx
 
 from app.core.encryption import decrypt_data
 from app.database.models import OllamaServer
+
+logger = logging.getLogger(__name__)
 
 
 def auth_headers(server: OllamaServer) -> Dict[str, str]:
@@ -16,6 +19,11 @@ def auth_headers(server: OllamaServer) -> Dict[str, str]:
         api_key = decrypt_data(server.encrypted_api_key)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            logger.error(
+                f"Server '{server.name}' has a stored API key that could not be decrypted; "
+                "the request will be sent unauthenticated. Re-enter the key or restore SECRET_KEY."
+            )
     return headers
 
 
