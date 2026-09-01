@@ -48,12 +48,13 @@ async def login_rate_limiter(request: Request):
 
     client_ip = request.client.host
     key = f"login_fail:{client_ip}"
-
+    
     try:
         current_fails = await redis_client.get(key)
-        ttl = await redis_client.ttl(key) if current_fails else 0
+        ttl = await redis_client.ttl(key) if current_fails else None
     except Exception as e:
-        logger.error(f"Could not connect to Redis for login rate limiting: {e}")
+        # Fail open: an unreachable Redis must not lock admins out of the login page.
+        logger.error(f"Could not connect to Redis for login rate limiting: {e}", exc_info=True)
         return True
 
     if current_fails and int(current_fails) >= 5:
@@ -158,9 +159,10 @@ async def rate_limiter(
         current_requests = await redis_client.incr(key)
         if current_requests == 1:
             await redis_client.expire(key, window)
-        ttl = await redis_client.ttl(key) if current_requests > limit else 0
+        ttl = await redis_client.ttl(key) if current_requests > limit else None
     except Exception as e:
-        logger.error(f"Could not connect to Redis for rate limiting: {e}")
+        # Fail open: rate limiting is best-effort and must not take the proxy down with Redis.
+        logger.error(f"Could not connect to Redis for rate limiting: {e}", exc_info=True)
         return True
 
     if current_requests > limit:

@@ -105,8 +105,7 @@ async def admin_playground_stream(
             
             payload = translate_ollama_to_vllm_chat(ollama_payload)
             
-            from app.crud.server_crud import _get_auth_headers
-            headers = _get_auth_headers(target_server)
+            headers = server_crud.get_auth_headers(target_server)
 
             async def event_stream_vllm():
                 try:
@@ -116,7 +115,7 @@ async def admin_playground_stream(
                             error_text = error_body.decode('utf-8')
                             logger.error(f"vLLM backend returned error {response.status_code}: {error_text}")
                             error_payload = {"error": f"vLLM server error: {error_text}"}
-                            yield json.dumps(error_payload).encode('utf-8')
+                            yield (json.dumps(error_payload) + '\n').encode('utf-8')
                             return
                         
                         async for chunk in vllm_stream_to_ollama_stream(response.aiter_text(), model_name):
@@ -124,7 +123,7 @@ async def admin_playground_stream(
                 except Exception as e:
                     logger.error(f"Error streaming from vLLM backend: {e}", exc_info=True)
                     error_payload = {"error": "Failed to stream from backend server.", "details": str(e)}
-                    yield json.dumps(error_payload).encode('utf-8')
+                    yield (json.dumps(error_payload) + '\n').encode('utf-8')
             
             return StreamingResponse(event_stream_vllm(), media_type="application/x-ndjson")
 
@@ -141,8 +140,7 @@ async def admin_playground_stream(
                 else:
                     logger.warning(f"Frontend requested thinking for '{model_name}', but it's not in the known support list. Ignoring 'think' parameter.")
 
-            from app.crud.server_crud import _get_auth_headers
-            headers = _get_auth_headers(target_server)
+            headers = server_crud.get_auth_headers(target_server)
 
             async def event_stream_ollama():
                 final_chunk_from_ollama = None
@@ -234,11 +232,13 @@ async def admin_playground_stream(
                         yield (json.dumps(final_chunk_from_ollama) + '\n').encode('utf-8')
                     else:
                         logger.error("No 'done' chunk received from Ollama stream.")
+                        error_payload = {"error": "Backend stream ended without completing the response."}
+                        yield (json.dumps(error_payload) + '\n').encode('utf-8')
 
                 except Exception as e:
                     logger.error(f"Error streaming from Ollama backend: {e}", exc_info=True)
                     error_payload = {"error": "Failed to stream from backend server.", "details": str(e)}
-                    yield json.dumps(error_payload).encode('utf-8')
+                    yield (json.dumps(error_payload) + '\n').encode('utf-8')
             
             return StreamingResponse(event_stream_ollama(), media_type="application/x-ndjson")
 

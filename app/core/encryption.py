@@ -30,7 +30,10 @@ try:
         [Fernet(_derive_key(settings.SECRET_KEY)), Fernet(_legacy_key(settings.SECRET_KEY))]
     )
 except Exception as e:
-    logger.error(f"Failed to initialize Fernet for encryption: {e}")
+    logger.critical(
+        f"Failed to initialize Fernet for encryption: {e}. "
+        "Backend API keys can neither be stored nor used until SECRET_KEY is fixed."
+    )
     fernet = None
 
 def encrypt_data(data: str) -> str:
@@ -51,5 +54,7 @@ def decrypt_data(encrypted_data: str) -> str:
         return fernet.decrypt(encrypted_data.encode()).decode()
     except Exception:
         # If decryption fails (e.g., key changed, data corrupted), return empty
-        logger.warning("Failed to decrypt data. Key may have changed or data is invalid.")
+        logger.warning(
+            "Failed to decrypt data. Key may have changed or data is invalid.", exc_info=True
+        )
         return ""

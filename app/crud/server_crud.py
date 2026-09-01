@@ -12,12 +12,17 @@ import json
 
 logger = logging.getLogger(__name__)
 
-def _get_auth_headers(server: OllamaServer) -> Dict[str, str]:
+def get_auth_headers(server: OllamaServer) -> Dict[str, str]:
     headers = {}
     if server.encrypted_api_key:
         api_key = decrypt_data(server.encrypted_api_key)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            logger.error(
+                f"Server '{server.name}' has a stored API key that could not be decrypted; "
+                "the request will be sent unauthenticated. Re-enter the key or restore SECRET_KEY."
+            )
     return headers
 
 async def get_server_by_id(db: AsyncSession, server_id: int) -> OllamaServer | None:
@@ -98,7 +103,7 @@ async def fetch_and_update_models(db: AsyncSession, server_id: int) -> dict:
     if not server:
         return {"success": False, "error": "Server not found", "models": []}
     
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
 
     try:
         models = []
@@ -168,21 +173,33 @@ async def pull_model_on_server(http_client: httpx.AsyncClient, server: OllamaSer
     if server.server_type == 'vllm':
         return {"success": False, "message": "Pulling models is not supported for vLLM servers."}
         
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
     pull_url = f"{server.url.rstrip('/')}/api/pull"
     payload = {"name": model_name, "stream": False}
     try:
         # Use a long timeout as pulling can take a significant amount of time
         async with http_client.stream("POST", pull_url, json=payload, timeout=1800.0, headers=headers) as response:
+            if response.status_code >= 400:
+                await response.aread()
+            response.raise_for_status()  # Will raise an exception for 4xx/5xx responses
+
+            stream_error = None
             async for chunk in response.aiter_text():
                 try:
                     line = json.loads(chunk)
-                    # You could process status updates here if needed in the future
-                    logger.debug(f"Pull status for {model_name} on {server.name}: {line.get('status')}")
                 except json.JSONDecodeError:
                     continue # Ignore non-json chunks
-        
-        response.raise_for_status() # Will raise an exception for 4xx/5xx responses
+                # Ollama reports pull failures in-band with a 200 status code.
+                if isinstance(line, dict) and line.get("error"):
+                    stream_error = line["error"]
+                else:
+                    logger.debug(f"Pull status for {model_name} on {server.name}: {line.get('status')}")
+
+        if stream_error:
+            error_msg = f"Failed to pull model '{model_name}': {stream_error}"
+            logger.error(f"{error_msg} on server '{server.name}'")
+            return {"success": False, "message": error_msg}
+
         logger.info(f"Successfully pulled/updated model '{model_name}' on server '{server.name}'")
         return {"success": True, "message": f"Model '{model_name}' pulled/updated successfully."}
     except httpx.HTTPStatusError as e:
@@ -199,7 +216,7 @@ async def delete_model_on_server(http_client: httpx.AsyncClient, server: OllamaS
     if server.server_type == 'vllm':
         return {"success": False, "message": "Deleting models is not supported for vLLM servers."}
 
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
     delete_url = f"{server.url.rstrip('/')}/api/delete"
     payload = {"name": model_name}
     try:
@@ -227,7 +244,7 @@ async def load_model_on_server(http_client: httpx.AsyncClient, server: OllamaSer
     if server.server_type == 'vllm':
         return {"success": False, "message": "Explicit model loading is not applicable for vLLM servers."}
 
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
     generate_url = f"{server.url.rstrip('/')}/api/generate"
     payload = {"model": model_name, "prompt": " ", "stream": False}
     try:
@@ -254,7 +271,7 @@ async def unload_model_on_server(http_client: httpx.AsyncClient, server: OllamaS
     if server.server_type == 'vllm':
         return {"success": False, "message": "Explicit model unloading is not applicable for vLLM servers."}
 
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
     generate_url = f"{server.url.rstrip('/')}/api/generate"
     # Setting keep_alive to 0s tells Ollama to unload the model after this request.
     payload = {"model": model_name, "prompt": " ", "keep_alive": "0s"}
@@ -408,7 +425,7 @@ async def get_active_models_all_servers(db: AsyncSession, http_client: httpx.Asy
     if ollama_servers:
         async def fetch_ps(server: OllamaServer):
             try:
-                headers = _get_auth_headers(server)
+                headers = get_auth_headers(server)
                 ps_url = f"{server.url.rstrip('/')}/api/ps"
                 response = await http_client.get(ps_url, timeout=5.0, headers=headers)
                 response.raise_for_status()
@@ -474,7 +491,7 @@ async def refresh_all_server_models(db: AsyncSession) -> dict:
 
 async def check_server_health(http_client: httpx.AsyncClient, server: OllamaServer) -> Dict[str, Any]:
     """Performs a quick health check on a single Ollama server."""
-    headers = _get_auth_headers(server)
+    headers = get_auth_headers(server)
     try:
         ping_url = server.url.rstrip('/')
         # vLLM servers have a /health endpoint, Ollama root is enough
