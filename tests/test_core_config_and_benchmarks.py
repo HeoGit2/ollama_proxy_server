@@ -1,4 +1,5 @@
 import base64
+import sys
 
 import pytest
 
@@ -23,6 +24,13 @@ class TestSettings:
         assert fresh.ADMIN_USER == "root"
         assert fresh.PROXY_PORT == 9999
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.environ folds variable names to a single case at the OS level on "
+        "Windows, so monkeypatch.setenv('admin_user', ...) is indistinguishable from "
+        "setting ADMIN_USER before pydantic-settings ever sees it — this test cannot "
+        "observe case_sensitive=True on this platform",
+    )
     def test_is_case_sensitive(self, monkeypatch):
         monkeypatch.setenv("admin_user", "lowercase")
         assert Settings(_env_file=None).ADMIN_USER == "admin"
