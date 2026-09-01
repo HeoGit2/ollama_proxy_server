@@ -304,14 +304,18 @@ async def admin_add_server(
             await server_crud.create_server(db, server=server_in)
             flash(request, f"Server '{server_name}' ({server_type}) added successfully.", "success")
         except Exception as e:
-            logger.error(f"Error adding server: {e}")
-            flash(request, "Invalid URL format or server type.", "error")
+            logger.error(f"Error adding server '{server_name}': {e}", exc_info=True)
+            flash(request, f"Could not add server '{server_name}': {e}", "error")
     return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
 
 @router.post("/servers/{server_id}/delete", name="admin_delete_server", dependencies=[Depends(validate_csrf_token)])
 async def admin_delete_server(request: Request, server_id: int, db: AsyncSession = Depends(get_db), admin_user: User = Depends(require_admin_user)):
-    await server_crud.delete_server(db, server_id=server_id)
-    flash(request, "Server deleted successfully.", "success")
+    deleted_server = await server_crud.delete_server(db, server_id=server_id)
+    if deleted_server:
+        flash(request, "Server deleted successfully.", "success")
+    else:
+        logger.warning(f"Attempted to delete non-existent server id {server_id}.")
+        flash(request, "Server not found; nothing was deleted.", "error")
     return RedirectResponse(url=request.url_for("admin_servers"), status_code=status.HTTP_303_SEE_OTHER)
 
 @router.post("/servers/{server_id}/refresh-models", name="admin_refresh_models", dependencies=[Depends(validate_csrf_token)])
@@ -659,22 +663,22 @@ async def admin_settings_post(
     ui_style = form_data.get("ui_style", current_settings.ui_style)
     new_redis_password = form_data.get("redis_password")
     
-    update_data.update({
-        "branding_title": form_data.get("branding_title"),
-        "ui_style": ui_style,
-        "selected_theme": selected_theme,
-        "redis_host": form_data.get("redis_host"),
-        "redis_port": int(form_data.get("redis_port", 6379)),
-        "redis_username": form_data.get("redis_username") or None,
-        "model_update_interval_minutes": int(form_data.get("model_update_interval_minutes", 10)),
-        "allowed_ips": form_data.get("allowed_ips", ""),
-        "denied_ips": form_data.get("denied_ips", ""),
-        "blocked_ollama_endpoints": form_data.get("blocked_ollama_endpoints", ""),
-    })
-    if new_redis_password:
-        update_data["redis_password"] = new_redis_password
-        
     try:
+        update_data.update({
+            "branding_title": form_data.get("branding_title"),
+            "ui_style": ui_style,
+            "selected_theme": selected_theme,
+            "redis_host": form_data.get("redis_host"),
+            "redis_port": int(form_data.get("redis_port", 6379)),
+            "redis_username": form_data.get("redis_username") or None,
+            "model_update_interval_minutes": int(form_data.get("model_update_interval_minutes", 10)),
+            "allowed_ips": form_data.get("allowed_ips", ""),
+            "denied_ips": form_data.get("denied_ips", ""),
+            "blocked_ollama_endpoints": form_data.get("blocked_ollama_endpoints", ""),
+        })
+        if new_redis_password:
+            update_data["redis_password"] = new_redis_password
+
         updated_settings_data = current_settings.model_copy(update=update_data)
         await settings_crud.update_app_settings(db, settings_data=updated_settings_data)
         request.app.state.settings = updated_settings_data
